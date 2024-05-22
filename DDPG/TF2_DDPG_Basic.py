@@ -17,32 +17,38 @@ from Prioritized_Replay import Memory
 tf.keras.backend.set_floatx('float64')
 
 
-def actor(state_shape, action_dim, action_bound, action_shift, units=(400, 300)):
+def actor(state_shape, num_discrete_actions, num_continuous_actions, action_bound, action_shift, units=(400, 300)):
     state = Input(shape=state_shape)
-    x = Dense(units[0], name="L0", activation='relu')(state)
+    x = Dense(units[0], activation='relu')(state)
     for index in range(1, len(units)):
-        x = Dense(units[index], name="L{}".format(index), activation='relu')(x)
+        x = Dense(units[index], activation='relu')(x)
+    
+    # 離散動作輸出
+    discrete_output = Dense(num_discrete_actions, activation='softmax', name='discrete_out')(x)
 
-    unscaled_output = Dense(action_dim, name="Out", activation='tanh')(x)
-    scalar = action_bound * np.ones(action_dim)
-    output = Lambda(lambda op: op * scalar)(unscaled_output)
-    if np.sum(action_shift) != 0:
-        output = Lambda(lambda op: op + action_shift)(output)  # for action range not centered at zero
+    # 連續動作輸出
+    unscaled_continuous_output = Dense(num_continuous_actions, activation='tanh', name='continuous_out')(x)
+    scaled_continuous_output = Lambda(lambda op: op * action_bound)(unscaled_continuous_output)
+    if action_shift != 0:
+       scaled_continuous_output = Lambda(lambda op: op + action_shift)(scaled_continuous_output)  # for action range not centered at zero
 
-    model = Model(inputs=state, outputs=output)
+
+    model = Model(inputs=state, outputs=[discrete_output, scaled_continuous_output])
 
     return model
 
 
-def critic(state_shape, action_dim, units=(48, 24)):
-    inputs = [Input(shape=state_shape), Input(shape=(action_dim,))]
-    concat = Concatenate(axis=-1)(inputs)
-    x = Dense(units[0], name="L0", activation='relu')(concat)
-    for index in range(1, len(units)):
-        x = Dense(units[index], name="L{}".format(index), activation='relu')(x)
-    output = Dense(1, name="Out")(x)
-    model = Model(inputs=inputs, outputs=output)
+def critic(state_shape, num_discrete_actions, num_continuous_actions, units=(48, 24)):
+    state_input = Input(shape=state_shape)
+    discrete_action_input = Input(shape=(num_discrete_actions,))
+    continuous_action_input = Input(shape=(num_continuous_actions,))
 
+    concat = Concatenate(axis=-1)([state_input, discrete_action_input, continuous_action_input])
+    x = Dense(units[0], activation='relu')(concat)
+    for index in range(1, len(units)):
+        x = Dense(units[index], activation='relu')(x)
+    output = Dense(1)(x)
+    model = Model(inputs=[state_input, discrete_action_input, continuous_action_input], outputs=output)
     return model
 
 
@@ -103,6 +109,16 @@ class DDPG:
             memory_cap=100000
     ):
         self.env = env
+        
+        if isinstance(env.action_space, gym.spaces.Discrete):
+            num_discrete_actions = env.action_space.n
+            num_continuous_actions = 0
+        elif isinstance(env.action_space, gym.spaces.Box):
+            num_discrete_actions = 0  # 如果环境只有连续动作，离散动作数设置为0
+            num_continuous_actions = env.action_space.shape[0]
+        else:
+            raise NotImplementedError("Action space type not supported")
+        
         self.state_shape = env.observation_space.shape  # shape of observations
         self.action_dim = env.action_space.n if discrete else env.action_space.shape[0]  # number of actions
         self.discrete = discrete
@@ -114,16 +130,19 @@ class DDPG:
             self.noise = OrnsteinUhlenbeckNoise(mu=np.zeros(self.action_dim), sigma=sigma)
         else:
             self.noise = NormalNoise(mu=np.zeros(self.action_dim), sigma=sigma)
+        
+        num_discrete_actions = 1
+        num_continuous_actions = env.action_space.shape[0] 
 
         # Define and initialize Actor network
-        self.actor = actor(self.state_shape, self.action_dim, self.action_bound, self.action_shift, actor_units)
-        self.actor_target = actor(self.state_shape, self.action_dim, self.action_bound, self.action_shift, actor_units)
+        self.actor = actor(self.state_shape,num_discrete_actions, num_continuous_actions, self.action_bound, self.action_shift, actor_units)
+        self.actor_target = actor(self.state_shape, num_discrete_actions, num_continuous_actions, self.action_bound, self.action_shift, actor_units)
         self.actor_optimizer = Adam(learning_rate=lr_actor)
         update_target_weights(self.actor, self.actor_target, tau=1.)
 
         # Define and initialize Critic network
-        self.critic = critic(self.state_shape, self.action_dim, critic_units)
-        self.critic_target = critic(self.state_shape, self.action_dim, critic_units)
+        self.critic = critic(self.state_shape, num_discrete_actions, num_continuous_actions, critic_units)
+        self.critic_target = critic(self.state_shape,num_discrete_actions, num_continuous_actions, critic_units)
         self.critic_optimizer = Adam(learning_rate=lr_critic)
         update_target_weights(self.critic, self.critic_target, tau=1.)
 
@@ -134,16 +153,27 @@ class DDPG:
 
         # Tensorboard
         self.summaries = {}
-
+    
     def act(self, state, add_noise=True):
         state = np.expand_dims(state, axis=0).astype(np.float32)
-        a = self.actor.predict(state)
-        a += self.noise() * add_noise * self.action_bound
-        a = tf.clip_by_value(a, -self.action_bound + self.action_shift, self.action_bound + self.action_shift)
+        discrete_action_probs, continuous_action_values = self.actor.predict(state)
+        discrete_action = np.argmax(discrete_action_probs)  # 选择概率最高的离散动作
+        continuous_action = continuous_action_values[0]  # 取出连续动作值
+        if add_noise:
+            continuous_action += self.noise() * self.action_bound
+        continuous_action = np.clip(continuous_action, -self.action_bound + self.action_shift, self.action_bound + self.action_shift)
 
-        self.summaries['q_val'] = self.critic.predict([state, a])[0][0]
+        return discrete_action, continuous_action
 
-        return a
+#    def act(self, state, add_noise=True):
+#        state = np.expand_dims(state, axis=0).astype(np.float32)
+#        a = self.actor.predict(state)
+#        a += self.noise() * add_noise * self.action_bound
+#        a = tf.clip_by_value(a, -self.action_bound + self.action_shift, self.action_bound + self.action_shift)
+#
+#        self.summaries['q_val'] = self.critic.predict([state, a])[0][0]
+#
+#        return a 
 
     def save_model(self, a_fn, c_fn):
         self.actor.save(a_fn)
